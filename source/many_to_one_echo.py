@@ -10,7 +10,6 @@ The server simply echoes all of the data that it sent to it.
 Study the example here: http://linux.die.net/man/4/epoll
 
 TODO: three approaches:
-- Manually keeping track of all of the connections
 - select
 - epoll
 """
@@ -71,6 +70,7 @@ def listen(init_barr, term_cond, new_conn_list, new_conn_list_lock):
 		while not term_cond.is_set():
 			try:
 				(conn, addr) = sock.accept()
+				conn.setblocking(False)
 			except OSError as e:
 				if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
 					raise
