@@ -10,22 +10,15 @@ echoes all of the data that it sent to it.
 
 import os
 import sys
-import time
-import errno
-
 import socket
 
 from argparse import ArgumentParser
-from contextlib import contextmanager
 
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
 from source.common import *
 
-SERVER_PORT        = 7700
-SERVER_BUFFER_SIZE = 4096
-
 def parse_args():
-	parser = ArgumentParser("A one-way communication channel between a client and a server.")
+	parser = ArgumentParser("Opens a one-way communication channel from a client to a server.")
 	parser.add_argument('--role', type=str, choices=['client', 'server'], required=True)
 	parser.add_argument('--server_address', type=str)
 	args = parser.parse_args()
@@ -36,30 +29,25 @@ def parse_args():
 
 def run_client(args):
 	msg = "Hi I love you.\n".encode('utf-8')
-	sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-
-	try:
-		sock.connect((args.server_address, SERVER_PORT))
-
-		while True:
-			send(msg, sock)
-			time.sleep(0.5)
-	except OSError as e:
-		if e.errno == errno.EPIPE:
-			print("Connection closed.", file=sys.stderr)
-		else:
-			raise
-	finally:
-		sock.close()
-
-@contextmanager
-def accept(sock):
-	conn, addr = sock.accept()
-	yield conn, addr
-	conn.close()
+	loop_message(msg, args)
 
 def run_server(args):
-	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+	sock = None
+	conn = None
+	listening = False
+
+	def cleanup(signum=None, frame=None):
+		close_socket(sock)
+		close_socket(conn)
+
+		if listening:
+			print("Stopped listening.", file=sys.stderr, flush=True)
+		if signum is not None:
+			sys.exit(1)
+
+	@safely_invoke(on_shutdown=cleanup, catch_signals=True)
+	def loop():
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 		sock.bind((socket.gethostname(), SERVER_PORT))
 
 		"""
@@ -78,20 +66,22 @@ def run_server(args):
 		Since this is a one-to-one commnunication channel, we just set the backlog to one.
 		"""
 		sock.listen(1)
-		print("Listening on {}:{}.".format(socket.gethostname(), SERVER_PORT))
 
-		with accept(sock) as (conn, addr):
-			buf = bytearray(SERVER_BUFFER_SIZE)
-			while True:
-				count = conn.recv_into(buf)
-				if count == 0:
-					print("Connection closed.", file=sys.stderr)
-					return
-				print(buf[:count].decode('utf-8'), end='', flush=True)
+		listening = True
+		print("Listening on {}:{}.".format(socket.gethostname(), SERVER_PORT),
+			file=sys.stderr)
+
+		conn, _ = sock.accept()
+		msg_buf = bytearray(SERVER_BUFFER_SIZE)
+
+		while True:
+			count = conn.recv_into(msg_buf)
+			if count == 0:
+				print("Connection closed.", file=sys.stderr, flush=True)
+				cleanup()
+				return
+			print(msg_buf[:count].decode('utf-8'), end='', flush=True)
 
 if __name__ == '__main__':
 	args = parse_args()
-	{
-		'client': run_client,
-		'server': run_server
-	}[args.role](args)
+	{'client': run_client, 'server': run_server}[args.role](args)
