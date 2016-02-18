@@ -1,3 +1,3 @@
 # Overview
 
-Experiments involving sockets using Python.
+Experiments involving sockets in Python.
