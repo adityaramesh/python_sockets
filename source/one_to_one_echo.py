@@ -17,13 +17,12 @@ import select
 if 'EPOLLRDHUP' not in dir(select):
 	select.EPOLLRDHUP = 0x2000
 
-from errno import EAGAIN, EWOULDBLOCK, ECONNABORTED, EINTR
 from signalfd import SFD_NONBLOCK, SFD_CLOEXEC, SIG_BLOCK
 from select import EPOLLIN, EPOLLERR, EPOLLRDHUP, EPOLLHUP, EPOLL_CLOEXEC
 from argparse import ArgumentParser
 
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
-from source.common import shutdown_signals, close_socket, check_signal, send_message
+from source.common import shutdown_signals, close_socket, accept, check_signal, send_message
 from source.settings import *
 
 def parse_args():
@@ -40,38 +39,24 @@ def run_client(args):
 	msg = "Hi I love you.\n".encode('utf-8')
 	send_message(msg, (args.server_address, SERVER_PORT))
 
-def accept(sock):
-	try:
-		return sock.accept()
-	except OSError as e:
-		if e.errno not in {EAGAIN, EWOULDBLOCK, ECONNABORTED, EINTR}:
-			raise
-
 def poll_connection(sock, sig_fd, epoll):
 	while True:
 		events = epoll.poll()
 
 		for fd, event in events:
 			if fd == sock.fileno():
-				addr = accept(sock)
-				if addr:
-					return addr
+				if event & (EPOLLIN | EPOLLERR):
+					addr = accept(sock)
+					if addr:
+						return addr
+				else:
+					print("Unexpected event {:#x} for socket FD.".format(event),
+						file=sys.stderr, flush=True)
 			elif fd == sig_fd:
 				check_signal(sig_fd, event)
-
-def read(conn, msg_buf):
-	while True:
-		try:
-			count = conn.recv_into(msg_buf)
-			if count == 0:
-				raise BrokenPipeError("Connection closed.")
-
-			print(msg_buf[:count].decode('utf-8'), end='', flush=True)
-		except OSError as e:
-			if e.errno in {EAGAIN, EWOULDBLOCK, EINTR}:
-				return
 			else:
-				raise
+				print("Unexpected FD {} obtained from epoll.".format(fd),
+					file=sys.stderr, flush=True)
 
 def poll_data(conn, sig_fd, epoll):
 	msg_buf = bytearray(SERVER_BUFFER_SIZE)
@@ -82,12 +67,21 @@ def poll_data(conn, sig_fd, epoll):
 		for fd, event in events:
 			if fd == conn.fileno():
 				if event & (EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP):
+					"""
+					Reading from the socket should really be done on another
+					thread, to ensure responsiveness. A good way to do this
+					would be using a work-stealing queue, but Python is a bad
+					fit for this.
+					"""
 					read(conn, msg_buf)
 				else:
 					print("Unexpected event {:#x} for connection FD.".
 						format(event), file=sys.stderr, flush=True)
 			elif fd == sig_fd:
 				check_signal(sig_fd, event)
+			else:
+				print("Unexpected FD {} obtained from epoll.".format(fd),
+					file=sys.stderr, flush=True)
 
 def run_server(args):
 	"""

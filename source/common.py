@@ -39,6 +39,27 @@ def close_socket(sock, how=socket.SHUT_RDWR):
 
 	sock.close()
 
+def accept(sock):
+	try:
+		return sock.accept()
+	except OSError as e:
+		if e.errno not in {EAGAIN, EWOULDBLOCK, ECONNABORTED, EINTR}:
+			raise
+
+def read(conn, msg_buf):
+	while True:
+		try:
+			count = conn.recv_into(msg_buf)
+			if count == 0:
+				raise BrokenPipeError("Connection closed.")
+
+			print(msg_buf[:count].decode('utf-8'), end='', flush=True)
+		except OSError as e:
+			if e.errno in {EAGAIN, EWOULDBLOCK, EINTR}:
+				return
+			else:
+				raise
+
 class MessageSender:
 	def __init__(self, msg, sock):
 		self.msg = msg
@@ -61,6 +82,8 @@ class MessageSender:
 						return
 					elif e.errno == EPIPE:
 						raise BrokenPipeError("Connection closed.")
+					else:
+						raise
 
 				if sent == 0:
 					raise BrokenPipeError("Connection closed.")
