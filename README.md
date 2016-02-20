@@ -11,6 +11,7 @@ Experiments involving sockets in Python.
 - If your program does not have real-time constraints, consider using `TCP_SOCK`. On the other hand,
   if your program does have real-time constraints, use `TCP_NODELAY`.
 - In order to implement rate-throttling for outgoing data, consider using `EPOLLONESHOT`.
+- To send messages from a worker thread to an epoll-loop thread, use eventfd.
 
 ## Efficiency
 
