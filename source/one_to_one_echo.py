@@ -10,12 +10,21 @@ echoes all of the data that it sent to it.
 
 import os
 import sys
+import signalfd
 import socket
+import select
 
+if 'EPOLLRDHUP' not in dir(select):
+	select.EPOLLRDHUP = 0x2000
+
+from errno import EAGAIN, EWOULDBLOCK, ECONNABORTED, EINTR
+from signalfd import SFD_NONBLOCK, SFD_CLOEXEC, SIG_BLOCK
+from select import EPOLLIN, EPOLLERR, EPOLLRDHUP, EPOLLHUP, EPOLL_CLOEXEC
 from argparse import ArgumentParser
 
 sys.path.insert(1, os.path.join(sys.path[0], '..'))
-from source.common import *
+from source.common import shutdown_signals, close_socket, check_signal, send_message
+from source.settings import *
 
 def parse_args():
 	parser = ArgumentParser("Opens a one-way communication channel from a client to a server.")
@@ -29,26 +38,83 @@ def parse_args():
 
 def run_client(args):
 	msg = "Hi I love you.\n".encode('utf-8')
-	loop_message(msg, args)
+	send_message(msg, (args.server_address, SERVER_PORT))
+
+def accept(sock):
+	try:
+		return sock.accept()
+	except OSError as e:
+		if e.errno not in {EAGAIN, EWOULDBLOCK, ECONNABORTED, EINTR}:
+			raise
+
+def poll_connection(sock, sig_fd, epoll):
+	while True:
+		events = epoll.poll()
+
+		for fd, event in events:
+			if fd == sock.fileno():
+				addr = accept(sock)
+				if addr:
+					return addr
+			elif fd == sig_fd:
+				check_signal(sig_fd, event)
+
+def read(conn, msg_buf):
+	while True:
+		try:
+			count = conn.recv_into(msg_buf)
+			if count == 0:
+				raise BrokenPipeError("Connection closed.")
+
+			print(msg_buf[:count].decode('utf-8'), end='', flush=True)
+		except OSError as e:
+			if e.errno in {EAGAIN, EWOULDBLOCK, EINTR}:
+				return
+			else:
+				raise
+
+def poll_data(conn, sig_fd, epoll):
+	msg_buf = bytearray(SERVER_BUFFER_SIZE)
+
+	while True:
+		events = epoll.poll()
+
+		for fd, event in events:
+			if fd == conn.fileno():
+				if event & (EPOLLIN | EPOLLERR | EPOLLRDHUP | EPOLLHUP):
+					read(conn, msg_buf)
+				else:
+					print("Unexpected event {:#x} for connection FD.".
+						format(event), file=sys.stderr, flush=True)
+			elif fd == sig_fd:
+				check_signal(sig_fd, event)
 
 def run_server(args):
-	sock = None
-	conn = None
-	listening = False
+	"""
+	It is important that we create the signal FD and block the signals before doing anything
+	else. Otherwise, we may get interrupted partway during initialization, and the resources we
+	have allocated thus far will not be released.
+	"""
+	sig_fd = signalfd.signalfd(-1, shutdown_signals, SFD_NONBLOCK | SFD_CLOEXEC)
+	signalfd.sigprocmask(SIG_BLOCK, shutdown_signals)
+	sock, conn, epoll = None, None, None
 
-	def cleanup(signum=None, frame=None):
-		close_socket(sock)
-		close_socket(conn)
-
-		if listening:
-			print("Stopped listening.", file=sys.stderr, flush=True)
-		if signum is not None:
-			sys.exit(1)
-
-	@safely_invoke(on_shutdown=cleanup, catch_signals=True)
-	def loop():
+	try:
 		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-		sock.bind((socket.gethostname(), SERVER_PORT))
+		sock.setblocking(False)
+
+		"""
+		Make the server accessible from all IPs assigned to this machine. SO_REUSEADDR
+		makes it so that if another server is running on another IP with the same port, then
+		``bind`` will still work. Of course, data sent to the other server's address will
+		still routed to it instead of us.
+		"""
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		sock.bind(('0.0.0.0', SERVER_PORT))
+
+		epoll = select.epoll(sizehint=2, flags=EPOLL_CLOEXEC)
+		epoll.register(sig_fd, EPOLLIN)
+		epoll.register(sock, EPOLLIN)
 
 		"""
 		The backlog bounds the rate at which the server can accept new TCP connections. In
@@ -66,21 +132,36 @@ def run_server(args):
 		Since this is a one-to-one commnunication channel, we just set the backlog to one.
 		"""
 		sock.listen(1)
-
-		listening = True
 		print("Listening on {}:{}.".format(socket.gethostname(), SERVER_PORT),
-			file=sys.stderr)
+			file=sys.stderr, flush=True)
 
-		conn, _ = sock.accept()
-		msg_buf = bytearray(SERVER_BUFFER_SIZE)
+		addr = poll_connection(sock, sig_fd, epoll)
+		sock.close()
+		sock = None
 
-		while True:
-			count = conn.recv_into(msg_buf)
-			if count == 0:
-				print("Connection closed.", file=sys.stderr, flush=True)
-				cleanup()
-				return
-			print(msg_buf[:count].decode('utf-8'), end='', flush=True)
+		addr[0].setblocking(False)
+		epoll.register(addr[0], EPOLLIN | EPOLLRDHUP)
+
+		print("Stopped listening for new connections.", file=sys.stderr, flush=True)
+		poll_data(addr[0], sig_fd, epoll)
+	except BrokenPipeError as e:
+		"""
+		A connection being closed is not really an exceptional situation, so we just print
+		the message rather than allow the interpreter to output the full stack trace.
+		"""
+		print(str(e), file=sys.stderr, flush=True)
+	except SystemExit as e:
+		print("Terminated.", file=sys.stderr, flush=True)
+		raise
+	finally:
+		if epoll:
+			epoll.close()
+
+		os.close(sig_fd)
+		if sock:
+			close_socket(sock)
+
+		close_socket(conn)
 
 if __name__ == '__main__':
 	args = parse_args()

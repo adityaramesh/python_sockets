@@ -4,72 +4,29 @@
 common.py
 ---------
 
-Utilites used by mulitple examples.
+Utilites used by multiple examples.
 """
 
+import os
 import sys
-import time
-import errno
-import signal
+import signalfd
 import socket
+import select
 
-SERVER_PORT         = 7700
-SERVER_BACKLOG_SIZE = 5
-SERVER_BUFFER_SIZE  = 4096
+if 'EPOLLRDHUP' not in dir(select):
+	select.EPOLLRDHUP = 0x2000
 
-def on_shutdown(handler):
-	"""
-	Registers a handler with all of the signals that are expected to initiate program shutdown.
-	The handler should be reentrant-safe.
-	"""
+from errno import EAGAIN, EWOULDBLOCK, EINTR, ENOBUFS, EPIPE
+from signal import SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGTERM
+from signalfd import SFD_NONBLOCK, SFD_CLOEXEC, SIG_BLOCK
+from select import EPOLLIN, EPOLLOUT, EPOLLERR, EPOLLRDHUP, EPOLLHUP, EPOLLONESHOT, EPOLL_CLOEXEC
 
-	for sig in [signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM]:
-		signal.signal(sig, handler)
-
-	return handler
-
-def safely_invoke(on_shutdown, catch_signals=False):
-	"""
-	Invokes a function ``func`` safely, so that resources are released by ``on_shutdown`` in the
-	event that an unexpected exception (or signal if ``catch_signals=True``) is caught.  Known
-	exceptions should still be caught and handled by ``func`` in case they should be serviced by
-	performing an action other than invoking ``on_shutdown``.
-
-	Args:
-		on_shutdown: Binary function registered as the signal handler. This function should
-			release any resources allocated by ``func``.
-
-		catch_signals: If true, registers ``on_shutdown`` as a signal handler using
-			``on_shutdown``. In this case, ``on_shutdown`` should be reentrant-safe, and
-			is not guaranteed to have thread-safe access to shared resources (as pthread
-			does not provide any guarantees on synchronization primitives while they are
-			used in signal handlers).
-
-			Note that when using the ``threading`` module, only the main thread receives
-			signals. So spawned threads should not need to register signal handlers
-			unless they are daemons.
-	"""
-
-	def inner_decorator(func):
-		if catch_signals:
-			globals()['on_shutdown'](on_shutdown)
-
-		try:
-			func()
-		except (KeyboardInterrupt, InterruptedError, SystemExit):
-			# The signal handler will already call ``shutdown`` for us.
-			assert catch_signals
-			raise
-		except:
-			on_shutdown(None, None)
-			raise
-
-	return inner_decorator
+shutdown_signals = {SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGTERM}
 
 def close_socket(sock, how=socket.SHUT_RDWR):
 	"""
-	In order to correctly close a socket, we must first call ``shutdown``, and then call
-	``close``, regardless of whether the former call succeeded. This function is reentrant-safe.
+	Closes ``sock`` after calling ``shutdown``, so that processes using the other end know that
+	we are no longer listening.
 	"""
 
 	if sock is None:
@@ -80,54 +37,107 @@ def close_socket(sock, how=socket.SHUT_RDWR):
 	except:
 		pass
 
-	try:
-		sock.close()
-	except:
-		pass
+	sock.close()
 
-def send(msg, sock):
-	"""
-	Transmits ``msg`` using ``sock``, and returns after ``msg`` has been sent.
-	"""
+class MessageSender:
+	def __init__(self, msg, sock):
+		self.msg = msg
+		self.sock = sock
+		self.total_sent = 0
 
-	total_sent = 0
+	def fileno(self):
+		return self.sock.fileno()
 
-	while total_sent != len(msg):
-		sent = sock.send(msg[total_sent:])
-		if sent == 0:
-			raise BrokenPipeError()
-		total_sent = total_sent + sent
+	def __iter__(self):
+		return self
 
-def loop_message(msg, args):
-	"""
-	Repeatedly transmits the message ``msg`` to the server whose address is given by ``args``.
-	"""
+	def __next__(self):
+		while True:
+			while self.total_sent != len(self.msg):
+				try:
+					sent = self.sock.send(self.msg[self.total_sent:])
+				except OSError as e:
+					if e.errno in {EAGAIN, EWOULDBLOCK, EINTR, ENOBUFS}:
+						return
+					elif e.errno == EPIPE:
+						raise BrokenPipeError("Connection closed.")
 
-	sock = None
-	connected = False
+				if sent == 0:
+					raise BrokenPipeError("Connection closed.")
+				self.total_sent = self.total_sent + sent
 
-	def cleanup(signum=None, frame=None):
-		close_socket(sock)
+			self.total_sent = 0
+			return
 
-		if connected:
-			print("Stopped sending.", file=sys.stderr, flush=True)
-		if signum is not None:
-			sys.exit(1)
+def check_signal(sig_fd, event):
+	if event & EPOLLIN:
+		si = signalfd.read_siginfo(sig_fd)
+		sig = si.ssi_signo
 
-	@safely_invoke(on_shutdown=cleanup, catch_signals=True)
-	def loop():
-		try:
-			sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-			sock.connect((args.server_address, SERVER_PORT))
+		if sig not in shutdown_signals:
+			print("Unexpected signal {}.".format(sig), file=sys.stderr, flush=True)
+		else:
+			raise SystemExit(sig)
+	else:
+		print("Unexpected event {:#x} for signal FD.".format(event), file=sys.stderr,
+			flush=True)
 
-			connected = True
-			print("Started sending.", file=sys.stderr, flush=True)
+def poll_events(sender, sig_fd, epoll):
+	register = False
 
-			while True:
-				send(msg, sock)
-				time.sleep(0.5)
-		except OSError as e:
-			if e.errno in [errno.EBADF, errno.EPIPE]:
-				print("Connection closed.", file=sys.stderr)
+	while True:
+		if register:
+			events = epoll.poll(timeout=0.5)
+			epoll.modify(sender.sock, EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT)
+			register = False
+		else:
+			events = epoll.poll()
+
+		for fd, event in events:
+			if fd == sender.fileno():
+				# Even if we get EPOLLRDHUP or EPOLLHUP, there may be unread data.
+				if event & (EPOLLOUT | EPOLLERR | EPOLLRDHUP | EPOLLHUP):
+					next(sender)
+					register = True
+				else:
+					print("Unexpected event {:#x} for socket FD.".format(event),
+						file=sys.stderr, flush=True)
+			elif fd == sig_fd:
+				check_signal(sig_fd, event)
 			else:
-				raise
+				print("Unexpected FD {} obtained from epoll.".format(fd),
+					file=sys.stderr, flush=True)
+
+def send_message(msg, dst):
+	"""
+	Repeatedly transmits the message ``msg`` to the address ``dst`` (an address-port tuple).
+	"""
+
+	sig_fd = signalfd.signalfd(-1, shutdown_signals, SFD_NONBLOCK | SFD_CLOEXEC)
+	signalfd.sigprocmask(SIG_BLOCK, shutdown_signals)
+	sock, epoll = None, None
+
+	try:
+		sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		sock.connect(dst)
+		sock.setblocking(False)
+		sender = MessageSender(msg, sock)
+
+		epoll = select.epoll(sizehint=2, flags=EPOLL_CLOEXEC)
+		epoll.register(sig_fd, EPOLLIN)
+		epoll.register(sock, EPOLLOUT | EPOLLRDHUP | EPOLLONESHOT)
+
+		print("Started sending.", file=sys.stderr, flush=True)
+		poll_events(sender, sig_fd, epoll)
+	except BrokenPipeError as e:
+		print(str(e), file=sys.stderr, flush=True)
+	except SystemExit as e:
+		print("Terminated.", file=sys.stderr, flush=True)
+		raise
+	finally:
+		if epoll:
+			epoll.close()
+
+		os.close(sig_fd)
+		close_socket(sock)
+		print("Stopped sending.", file=sys.stderr, flush=True)
