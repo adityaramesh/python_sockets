@@ -10,7 +10,12 @@ Experiments involving sockets in Python.
 - Carefully consider which signals we should detect and respond to.
 - If your program does not have real-time constraints, consider using `TCP_SOCK`. On the other hand,
   if your program does have real-time constraints, use `TCP_NODELAY`.
-- In order to implement rate-throttling for outgoing data, consider using `EPOLLONESHOT`.
+- When sending sporradic notifications to a set of clients, register the outgoing connections with
+  `EPOLLONESHOT`. This avoids busy-waiting on the sending thread when sockets are available for
+  writing, but we have no data to send.
+- When occasional event notifications need to be send between a server and client that are
+  continuously communicating using over a main channel, consider using the out-of-band feature of TCP
+  instead of opening another socket for this purpose. Linux's `send` explicitly supports this. 
 - To send messages from a worker thread to an epoll-loop thread, use eventfd.
 
 ## Efficiency
